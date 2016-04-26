@@ -20,17 +20,97 @@ function AbstractRecurrent:__init(rho)
    self.sharedClones = {}
    
    self:reset()
+
+   self.lruNodes = {}
+   self.lruList = nn.LinkedList()
+   self.lruMax = rho
 end
 
 function AbstractRecurrent:getStepModule(step)
    assert(step, "expecting step at arg 1")
    local recurrentModule = self.sharedClones[step]
-   if not recurrentModule then
+   if not recurrentModule or recurrentModule == self.recurrentModule then
       recurrentModule = self.recurrentModule:stepClone()
       self.sharedClones[step] = recurrentModule
       self.nSharedClone = _.size(self.sharedClones)
    end
-   return recurrentModule
+
+   -- Unless lruMax is configured, return step-module
+   if self.lruMax > self.rho then
+      return recurrentModule
+   end
+   
+   --print("Step = " .. step .. ". Free memory = " .. freeMem)
+   --print(self.lruList)
+
+   local function createIdentityParamCache(module) 
+      local params, gradParams = module:parameters()
+      local tensorCache = {}
+      for i, param in ipairs(params) do
+         tensorCache[param] = param
+      end
+      for i, gradParam in ipairs(gradParams) do
+         tensorCache[gradParam] = gradParam
+      end
+      return tensorCache
+   end
+
+   -- ensure that this step has a cuda module
+   local function float2Cuda(s)
+      local m = self.sharedClones[s]
+      assert(m:type() ~= 'torch.CudaTensor', s)
+      --print("Fetching step " .. s)
+      local tensorCache = createIdentityParamCache(m)
+      nn.rnn.stepCloneRecursiveType(m, 'torch.CudaTensor', tensorCache)
+      m._type = 'torch.CudaTensor'
+      self.sharedClones[s] = m
+      for i,a in pairs{self.outputs, self._gradOutputs, self.gradInputs, self.cells, self.gradCells} do
+         a[s] = nn.utils.recursiveType(a[s], 'torch.CudaTensor', tensorCache)
+      end
+   end
+
+   -- otherwise make sure to mark this step (and its dependnecy) as most-recently used
+   local dependencies = step == 1 and {step} or {step-1, step}
+   for i, s in ipairs(dependencies) do
+      if not self.lruNodes[s] then
+         -- add new node to the front of the list
+         self.lruNodes[s] = self.lruList:pushFront(s)
+         -- this is a new node because either (1) it is just allocated or (2) it is in CPU mem
+         -- and if so we move it to GPU memory;
+         -- either way, the list size increases by one indicating a new GPU module
+         if self.sharedClones[s]:type() ~= 'torch.CudaTensor' then
+            -- move to GPU memory
+            float2Cuda(s)
+         end
+      else
+         -- bring this node to front of the list
+         assert(self.sharedClones[s]:type() == 'torch.CudaTensor', s)
+         self.lruList:bringToFront(self.lruNodes[s])
+      end
+   end
+
+   -- if the LRU list is larger than allowable limit, then
+   -- boot off the least-recently used module to CPU memory
+   while self.lruList.length > self.lruMax do
+      local lruStep = self.lruList:popBack()
+      self.lruNodes[lruStep] = nil
+      local lruModule = self.sharedClones[lruStep]
+      -- only if this step has not been recycled
+      if lruModule and lruModule:type() == 'torch.CudaTensor' then
+         --print("Evicting step " .. lruStep)
+         local tensorCache = createIdentityParamCache(lruModule)
+         nn.rnn.stepCloneRecursiveType(lruModule, 'torch.FloatTensor', tensorCache)
+         lruModule._type = 'torch.FloatTensor'
+         self.sharedClones[lruStep] = lruModule
+         for i,a in pairs{self.outputs, self._gradOutputs, self.gradInputs, self.cells, self.gradCells} do
+            a[lruStep] = nn.utils.recursiveType(a[lruStep], 'torch.FloatTensor', tensorCache)
+         end
+      end
+   end
+   assert(self.lruList.length <= self.lruMax) -- implied by end-of-while
+
+   -- return this step's module
+   return self.sharedClones[step]
 end
 
 function AbstractRecurrent:maskZero(nInputDim)
@@ -197,6 +277,7 @@ end
 -- used by Recursor() after calling stepClone.
 -- this solves a very annoying bug...
 function AbstractRecurrent:setOutputStep(step)
+   self:getStepModule(step)
    self.output = self.outputs[step] --or self:getStepModule(step).output
    assert(self.output, "no output for step "..step)
    self.gradInput = self.gradInputs[step]

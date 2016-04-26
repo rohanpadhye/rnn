@@ -9,6 +9,7 @@ rnn.version = 2
 unpack = unpack or table.unpack
 
 torch.include('rnn', 'recursiveUtils.lua')
+torch.include('rnn', 'LinkedList.lua')
 
 -- extensions to nn.Module
 torch.include('rnn', 'Module.lua')
@@ -43,6 +44,7 @@ torch.include('rnn', 'Sequencer.lua')
 torch.include('rnn', 'BiSequencer.lua')
 torch.include('rnn', 'BiSequencerLM.lua')
 torch.include('rnn', 'RecurrentAttention.lua')
+torch.include('rnn', 'ConvertingSequencer.lua')
 
 -- sequencer + recurrent modules
 torch.include('rnn', 'SeqLSTM.lua')

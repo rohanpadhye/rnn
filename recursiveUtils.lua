@@ -47,6 +47,29 @@ function rnn.recursiveCopy(t1,t2)
    return t1, t2
 end
 
+function rnn.recursiveTypedCopy(t1, t2, type_str)
+   if torch.type(t2) == 'table' then
+      t1 = (torch.type(t1) == 'table') and t1 or {t1}
+      for key,_ in pairs(t2) do
+         t1[key], t2[key] = rnn.recursiveCopy(t1[key], t2[key])
+      end
+   elseif torch.isTensor(t2) then
+      if torch.isTensor(t1) then
+         if t1:type() ~= type_str then
+            error("expecting destination tensor of type " .. type_str ..
+               " but got " .. torch.type(t1) .. " instead")
+         end
+      else
+         t1 = torch.Tensor():type(type_str)
+      end
+      t1:resize(t2:size()):copy(t2)
+   else
+      error("expecting nested tensors or tables. Got "..
+            torch.type(t1).." and "..torch.type(t2).." instead")
+   end
+   return t1, t2
+end
+
 function rnn.recursiveAdd(t1, t2)
    if torch.type(t2) == 'table' then
       t1 = (torch.type(t1) == 'table') and t1 or {t1}
@@ -152,4 +175,35 @@ function rnn.recursiveNew(t2)
       error("expecting tensor or table thereof. Got "
            ..torch.type(t2).." instead")
    end
+end
+
+function rnn.stepCloneRecursiveType(param, type, tensorCache)
+   tensorCache = tensorCache or {}
+
+   if torch.type(param) == 'table' then
+      for k, v in pairs(param) do
+         param[k] = rnn.stepCloneRecursiveType(v, type, tensorCache)
+      end
+   elseif torch.isTypeOf(param, 'nn.Module') or
+          torch.isTypeOf(param, 'nn.Criterion') then
+      -- recurrent modules will handle their own step clones
+      if not torch.isTypeOf(param, 'nn.AbstractRecurrent') then
+         for k, v in pairs(param) do
+            param[k] = rnn.stepCloneRecursiveType(v, type, tensorCache)
+         end
+      end
+   elseif torch.isTensor(param) then
+      if torch.typename(param) ~= type then
+         local newparam
+         if tensorCache[param] then
+            newparam = tensorCache[param]
+         else
+            -- Use the default recursiveType implementation to cast tensor type
+            -- and update the tensorCache
+            newparam = nn.utils.recursiveType(param, type, tensorCache) 
+         end
+         param = newparam
+      end
+   end
+   return param
 end
