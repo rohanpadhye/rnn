@@ -17,12 +17,14 @@
 assert(not nn.ConvertingSequencer, "update nnx package : luarocks install nnx")
 local ConvertingSequencer, parent = torch.class('nn.ConvertingSequencer', 'nn.Sequencer')
 
-function ConvertingSequencer:__init(module)
+function ConvertingSequencer:__init(module, combinedBackward)
    parent.__init(self, module)
    -- self._type should ideally be initialized by nn.Module
    if not self._type then
       self._type = torch.Tensor():type()
    end
+   -- if combinedBackward is true, updateGradInput also does accGradParameters, and the latter does nothing
+   self.combinedBackward = combinedBackward == nil and true or combinedBackward
 end
 
 function ConvertingSequencer:updateOutput(inputTable)
@@ -84,6 +86,10 @@ function ConvertingSequencer:updateGradInput(inputTable, gradOutputTable)
       local gradInput = self.module:updateGradInput(input, gradOutput)
       -- convert gradInput from recurrent module type to sequencer type
       self.gradInput[step] = nn.rnn.recursiveType(gradInput, self:type())
+      -- accumulate gradParameters if combinedBackward 
+      if self.combinedBackward then
+         self.module:accGradParameters(input, gradOutput, 1)
+      end
    end
    
    assert(#inputTable == #self.gradInput, #inputTable.." ~= "..#self.gradInput)
@@ -92,6 +98,9 @@ function ConvertingSequencer:updateGradInput(inputTable, gradOutputTable)
 end
 
 function ConvertingSequencer:accGradParameters(inputTable, gradOutputTable, scale)
+   if self.combinedBackward then
+      return -- already accumulated gradParameters in updateGradInput
+   end
    assert(torch.type(gradOutputTable) == 'table', "expecting gradOutput table")
    assert(#gradOutputTable == #inputTable, "gradOutput should have as many elements as input")
    

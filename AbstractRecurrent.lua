@@ -24,6 +24,7 @@ function AbstractRecurrent:__init(rho)
    self.lruNodes = {}
    self.lruList = nn.LinkedList()
    self.lruMax = rho
+
 end
 
 function AbstractRecurrent:getStepModule(step)
@@ -40,7 +41,7 @@ function AbstractRecurrent:getStepModule(step)
       return recurrentModule
    end
    
-   --print("Step = " .. step .. ". Free memory = " .. freeMem)
+   --print(torch.type(self) .. " :: Step = " .. step)
    --print(self.lruList)
 
    local function createIdentityParamCache(module) 
@@ -59,7 +60,7 @@ function AbstractRecurrent:getStepModule(step)
    local function float2Cuda(s)
       local m = self.sharedClones[s]
       assert(m:type() ~= 'torch.CudaTensor', s)
-      --print("Fetching step " .. s)
+      --print(torch.type(self) .. " :: Fetching step " .. s)
       local tensorCache = createIdentityParamCache(m)
       nn.rnn.stepCloneRecursiveType(m, 'torch.CudaTensor', tensorCache)
       m._type = 'torch.CudaTensor'
@@ -95,21 +96,31 @@ function AbstractRecurrent:getStepModule(step)
       local lruStep = self.lruList:popBack()
       self.lruNodes[lruStep] = nil
       local lruModule = self.sharedClones[lruStep]
-      -- only if this step has not been recycled
+      -- only if this step has not been recycled and is needed for backward pass
       if lruModule and lruModule:type() == 'torch.CudaTensor' then
-         --print("Evicting step " .. lruStep)
-         local tensorCache = createIdentityParamCache(lruModule)
-         nn.rnn.stepCloneRecursiveType(lruModule, 'torch.FloatTensor', tensorCache)
-         lruModule._type = 'torch.FloatTensor'
-         self.sharedClones[lruStep] = lruModule
-         for i,a in pairs{self.outputs, self._gradOutputs, self.gradInputs, self.cells, self.gradCells} do
-            a[lruStep] = nn.utils.recursiveType(a[lruStep], 'torch.FloatTensor', tensorCache)
+         if self.accGradParametersStep and self.accGradParametersStep < lruStep then
+            -- allow deallocation
+            self.sharedClones[lruStep] = nil
+            for i,a in pairs{self.outputs, self._gradOutputs, self.gradInputs, self.cells, self.gradCells} do
+               a[lruStep] = nil
+            end
+         else
+            -- swap to system memory
+            --print(torch.type(self) .. " :: Evicting step " .. lruStep)
+            local tensorCache = createIdentityParamCache(lruModule)
+            nn.rnn.stepCloneRecursiveType(lruModule, 'torch.FloatTensor', tensorCache)
+            lruModule._type = 'torch.FloatTensor'
+            self.sharedClones[lruStep] = lruModule
+            for i,a in pairs{self.outputs, self._gradOutputs, self.gradInputs, self.cells, self.gradCells} do
+               a[lruStep] = nn.utils.recursiveType(a[lruStep], 'torch.FloatTensor', tensorCache)
+            end
          end
       end
    end
    assert(self.lruList.length <= self.lruMax) -- implied by end-of-while
 
    -- return this step's module
+   self.nSharedClone = _.size(self.sharedClones)
    return self.sharedClones[step]
 end
 
