@@ -4537,7 +4537,7 @@ function rnntest.rnnlm()
          local gradInputs2 = lm2:backward(inputs2, gradOutputs)
          lm2:updateParameters(0.1)
          
-         mytester:assertTensorEq(gradInputs, gradInputs2, 0.0000001, "gradInputs err")
+         mytester:assertTensorEq(gradInputs, gradInputs2:transpose(1,2), 0.0000001, "gradInputs err")
          for k=1,#outputs2 do
             mytester:assertTensorEq(outputs2[k], outputs[k], 0.0000001, "outputs err "..k)
          end
@@ -5009,6 +5009,191 @@ function rnntest.clearState()
       local t = {torch.Tensor(4), torch.Tensor(4), torch.Tensor(4)}
       local output = seq:forward(input)
    end
+end
+
+function rnntest.NormStabilizer()
+   if not pcall(function() require "optim" end) then
+      return 
+   end
+   local SequencerCriterion, parent = torch.class('nn.SequencerCriterionNormStab', 'nn.SequencerCriterion')
+
+   function SequencerCriterion:__init(criterion, beta)
+      parent.__init(self)
+      self.criterion = criterion
+      if torch.isTypeOf(criterion, 'nn.ModuleCriterion') then
+         error("SequencerCriterion shouldn't decorate a ModuleCriterion. "..
+            "Instead, try the other way around : "..
+            "ModuleCriterion decorates a SequencerCriterion. "..
+            "Its modules can also be similarly decorated with a Sequencer.")
+      end
+      self.clones = {}
+      self.gradInput = {}
+      self.beta = beta
+   end
+
+   function SequencerCriterion:updateOutput(inputTable, targetTable)
+      self.output = 0
+      for i,input in ipairs(inputTable) do
+         local criterion = self:getStepCriterion(i)
+         self.output = self.output + criterion:forward(input, targetTable[i])
+         if i > 1 then
+            local reg = 0
+            for j=1,input:size(1) do
+               reg = reg + ((input[j]:norm() - inputTable[i-1][j]:norm())^2)
+            end
+            self.output = self.output + self.beta * reg / input:size(1)
+         end
+      end
+      return self.output
+   end
+
+   -- Make a simple RNN and training set to test gradients 
+   -- hyper-parameters
+   local batchSize = 3
+   local rho = 2
+   local hiddenSize = 3
+   local inputSize = 4
+   local lr = 0.1
+   local beta = 50.0
+   
+   local r = nn.Recurrent(
+      hiddenSize, nn.Linear(inputSize, hiddenSize),
+      nn.Linear(hiddenSize, hiddenSize), nn.Sigmoid(),
+      rho
+   )
+   
+   -- build simple recurrent neural network
+   local rnn = nn.Sequential()
+      :add(r)
+      :add(nn.NormStabilizer(beta))
+   
+   rnn = nn.Sequencer(rnn)
+   local criterion = nn.SequencerCriterionNormStab(nn.MSECriterion(), beta)
+
+   local iteration = 1
+   local params, gradParams = rnn:getParameters()
+
+   while iteration < 5 do
+      -- generate a random data point
+      local inputs, targets = {}, {}
+      for step=1,rho do
+         inputs[step] = torch.randn(batchSize, inputSize)
+         targets[step] = torch.randn(batchSize, hiddenSize)
+      end
+
+      -- set up closure
+      local function feval(params_new)
+         if params ~= params_new then
+            params:copy(params_new)
+         end
+
+         rnn:zeroGradParameters()
+         local outputs = rnn:forward(inputs)
+         local err = criterion:forward(outputs, targets)
+         local gradOutputs = criterion:backward(outputs, targets)
+         local gradInputs = rnn:backward(inputs, gradOutputs)
+         return err, gradParams
+      end
+
+      -- compare numerical to analytic gradient
+      local diff, dC, dC_est = optim.checkgrad(feval, params, 1e-10)
+      mytester:assert(diff < 1e-3, "Numerical gradient and analytic gradient do not match.")
+
+      rnn:updateParameters(lr)
+
+      iteration = iteration + 1
+   end
+   
+   -- compare to other implementation :
+   local NS, parent = torch.class("nn.NormStabilizerTest", "nn.AbstractRecurrent")
+
+   function NS:__init(beta, rho)
+      parent.__init(self, rho or 9999)
+      self.recurrentModule = nn.CopyGrad()
+      self.beta = beta
+   end
+
+   function NS:_accGradParameters(input, gradOutput, scale)
+      -- No parameters to update
+   end
+
+   function NS:updateOutput(input)
+      local output
+      if self.train ~= false then
+         self:recycle()
+         local recurrentModule = self:getStepModule(self.step)
+         output = recurrentModule:updateOutput(input)
+      else
+         output = self.recurrentModule:updateOutput(input)
+      end
+
+      self.outputs[self.step] = output
+
+      self.output = output
+      self.step = self.step + 1
+      self.gradPrevOutput = nil
+      self.updateGradInputStep = nil
+      self.accGradParametersStep = nil
+
+      return self.output
+   end
+
+   function NS:_updateGradInput(input, gradOutput)    
+      -- First grab h[t] and h[t+1] :
+      -- backward propagate through this step
+      local curStep = self.updateGradInputStep-1
+      local hiddenModule = self:getStepModule(curStep)
+      hiddenModule:updateGradInput(input, gradOutput)
+      local hiddenState = hiddenModule.output
+
+      if curStep < self.step then
+         local batchSize = hiddenState:size(1)
+         if curStep > 1 then
+            local prevHiddenModule = self:getStepModule(curStep - 1)
+            local prevHiddenState = prevHiddenModule.output
+            -- Add norm stabilizer cost function directly to respective CopyGrad.gradInput tensors
+            for i=1,batchSize do
+               local dRegdNorm =  self.beta * 2 * (hiddenState[i]:norm()-prevHiddenState[i]:norm()) / batchSize
+               local dNormdHid = torch.div(hiddenState[i], hiddenState[i]:norm())
+               hiddenModule.gradInput[i]:add(torch.mul(dNormdHid, dRegdNorm))
+            end
+         end
+         if curStep < self.step-1 then
+            local nextHiddenModule = self:getStepModule(curStep + 1)
+            local nextHiddenState = nextHiddenModule.output
+            for i=1,batchSize do
+               local dRegdNorm = self.beta * -2 * (nextHiddenState[i]:norm() - hiddenState[i]:norm()) / batchSize
+               local dNormdHid = torch.div(hiddenState[i], hiddenState[i]:norm()) 
+               hiddenModule.gradInput[i]:add(torch.mul(dNormdHid, dRegdNorm))
+            end
+         end
+      end
+      return hiddenModule.gradInput
+   end
+   
+   local ns = nn.NormStabilizer(beta)
+   local ns2 = nn.NormStabilizerTest(beta)
+   
+   local seq = nn.Sequencer(ns)
+   local seq2 = nn.Sequencer(ns2)
+    
+   local inputs, gradOutputs = {}, {}
+   for step=1,rho do
+      inputs[step] = torch.randn(batchSize, inputSize)
+      gradOutputs[step] = torch.randn(batchSize, inputSize)
+   end
+   
+   local outputs = seq:forward(inputs)
+   local outputs2 = seq2:forward(inputs)
+   local gradInputs = seq:backward(inputs, gradOutputs)
+   local gradInputs2 = seq2:backward(inputs, gradOutputs)
+   
+   for step=1,rho do
+      mytester:assertTensorEq(outputs[step], outputs2[step], 0.0000001)
+      mytester:assertTensorEq(gradInputs[step], gradInputs2[step], 0.0000001)
+   end
+   
+   ns:updateLoss()
 end
 
 function rnn.test(tests, benchmark_)
